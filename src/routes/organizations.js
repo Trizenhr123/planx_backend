@@ -1,9 +1,12 @@
 import { Router } from 'express'
 import { z } from 'zod'
+import bcrypt from 'bcryptjs'
 import { Organization } from '../models/Organization.js'
 import { AuditLog } from '../models/AuditLog.js'
+import { User } from '../models/User.js'
 import { sendOrganizationInvite } from '../services/mailClient.js'
 import { serializeOrganization } from '../utils/serializeOrg.js'
+import { requireAuth, requireOrgScope, requireRole } from '../middleware/auth.js'
 
 export const organizationsRouter = Router()
 
@@ -20,7 +23,9 @@ const updateSchema = z.object({
   plan: z.enum(['free', 'pro', 'enterprise']).optional(),
 })
 
-organizationsRouter.get('/', async (_req, res, next) => {
+organizationsRouter.use(requireAuth)
+
+organizationsRouter.get('/', requireRole('SYSTEM_ADMIN', 'ADMIN'), async (_req, res, next) => {
   try {
     const orgs = await Organization.find().sort({ createdAt: -1 })
     res.json(orgs.map(serializeOrganization))
@@ -29,7 +34,7 @@ organizationsRouter.get('/', async (_req, res, next) => {
   }
 })
 
-organizationsRouter.get('/:id/stats', async (req, res, next) => {
+organizationsRouter.get('/:id/stats', requireRole('SYSTEM_ADMIN', 'ADMIN'), requireOrgScope, async (req, res, next) => {
   try {
     const org = await Organization.findById(req.params.id)
     if (!org) return res.status(404).json({ error: 'Organization not found' })
@@ -43,10 +48,11 @@ organizationsRouter.get('/:id/stats', async (req, res, next) => {
   }
 })
 
-organizationsRouter.post('/', async (req, res, next) => {
+organizationsRouter.post('/', requireRole('SYSTEM_ADMIN'), async (req, res, next) => {
   try {
     const body = createSchema.parse(req.body)
     const slug = body.slug.toLowerCase()
+    const adminEmail = body.adminEmail.toLowerCase()
 
     const existing = await Organization.findOne({ slug })
     if (existing) {
@@ -57,7 +63,7 @@ organizationsRouter.post('/', async (req, res, next) => {
       name: body.name,
       slug,
       plan: body.plan,
-      adminEmail: body.adminEmail.toLowerCase(),
+      adminEmail,
       collaboratorCount: 1,
       projectCount: 0,
       status: 'active',
@@ -65,6 +71,23 @@ organizationsRouter.post('/', async (req, res, next) => {
     })
 
     const demoPassword = process.env.DEFAULT_ORG_ADMIN_PASSWORD || 'admin123'
+    const passwordHash = await bcrypt.hash(demoPassword, 10)
+
+    await User.findOneAndUpdate(
+      { email: adminEmail },
+      {
+        $set: {
+          name: body.name,
+          email: adminEmail,
+          passwordHash,
+          role: 'ADMIN',
+          organizationId: org._id,
+          status: 'invited',
+          inviteStatus: 'pending',
+        },
+      },
+      { upsert: true, new: true, runValidators: true },
+    )
 
     try {
       await sendOrganizationInvite({
@@ -73,15 +96,16 @@ organizationsRouter.post('/', async (req, res, next) => {
         plan: org.plan,
         adminEmail: org.adminEmail,
         demoPassword,
-        createdBy: 'System Administrator',
+        createdBy: req.user.name,
       })
       org.inviteStatus = 'sent'
       org.inviteSentAt = new Date()
       await org.save()
+      await User.findOneAndUpdate({ email: adminEmail }, { $set: { inviteStatus: 'sent', inviteSentAt: new Date() } })
     } catch (mailErr) {
       org.inviteStatus = 'failed'
       await org.save()
-      console.error('Invite email failed:', mailErr.message)
+      await User.findOneAndUpdate({ email: adminEmail }, { $set: { inviteStatus: 'failed' } })
       return res.status(502).json({
         error: `Organization saved but invite email failed: ${mailErr.message}`,
         organization: serializeOrganization(org),
@@ -90,8 +114,9 @@ organizationsRouter.post('/', async (req, res, next) => {
 
     await AuditLog.create({
       action: 'Organization created',
-      actor: 'System Administrator',
+      actor: req.user.name,
       target: org.name,
+      ip: req.ip,
     })
 
     res.status(201).json(serializeOrganization(org))
@@ -106,20 +131,17 @@ organizationsRouter.post('/', async (req, res, next) => {
   }
 })
 
-organizationsRouter.patch('/:id', async (req, res, next) => {
+organizationsRouter.patch('/:id', requireRole('SYSTEM_ADMIN', 'ADMIN'), requireOrgScope, async (req, res, next) => {
   try {
     const body = updateSchema.parse(req.body)
-    const org = await Organization.findByIdAndUpdate(
-      req.params.id,
-      { $set: body },
-      { new: true, runValidators: true }
-    )
+    const org = await Organization.findByIdAndUpdate(req.params.id, { $set: body }, { new: true, runValidators: true })
     if (!org) return res.status(404).json({ error: 'Organization not found' })
 
     await AuditLog.create({
       action: 'Organization updated',
-      actor: 'System Administrator',
+      actor: req.user.name,
       target: org.name,
+      ip: req.ip,
     })
 
     res.json(serializeOrganization(org))
@@ -131,7 +153,7 @@ organizationsRouter.patch('/:id', async (req, res, next) => {
   }
 })
 
-organizationsRouter.post('/:id/resend-invite', async (req, res, next) => {
+organizationsRouter.post('/:id/resend-invite', requireRole('SYSTEM_ADMIN', 'ADMIN'), requireOrgScope, async (req, res) => {
   try {
     const org = await Organization.findById(req.params.id)
     if (!org) return res.status(404).json({ error: 'Organization not found' })
@@ -144,41 +166,44 @@ organizationsRouter.post('/:id/resend-invite', async (req, res, next) => {
       plan: org.plan,
       adminEmail: org.adminEmail,
       demoPassword,
-      createdBy: 'System Administrator',
+      createdBy: req.user.name,
     })
 
     org.inviteStatus = 'sent'
     org.inviteSentAt = new Date()
     await org.save()
 
+    await User.findOneAndUpdate(
+      { email: org.adminEmail },
+      { $set: { organizationId: org._id, inviteStatus: 'sent', inviteSentAt: new Date() } },
+      { new: true },
+    )
+
     await AuditLog.create({
       action: 'Organization invite resent',
-      actor: 'System Administrator',
+      actor: req.user.name,
       target: org.name,
+      ip: req.ip,
     })
 
     res.json(serializeOrganization(org))
   } catch (err) {
-    console.error('Invite email failed:', err.message)
     return res.status(502).json({
       error: `Invite email failed: ${err.message}`,
     })
   }
 })
 
-organizationsRouter.post('/:id/suspend', async (req, res, next) => {
+organizationsRouter.post('/:id/suspend', requireRole('SYSTEM_ADMIN', 'ADMIN'), requireOrgScope, async (req, res, next) => {
   try {
-    const org = await Organization.findByIdAndUpdate(
-      req.params.id,
-      { status: 'suspended' },
-      { new: true }
-    )
+    const org = await Organization.findByIdAndUpdate(req.params.id, { status: 'suspended' }, { new: true })
     if (!org) return res.status(404).json({ error: 'Organization not found' })
 
     await AuditLog.create({
       action: 'Organization suspended',
-      actor: 'System Administrator',
+      actor: req.user.name,
       target: org.name,
+      ip: req.ip,
     })
 
     res.json(serializeOrganization(org))
@@ -187,15 +212,16 @@ organizationsRouter.post('/:id/suspend', async (req, res, next) => {
   }
 })
 
-organizationsRouter.delete('/:id', async (req, res, next) => {
+organizationsRouter.delete('/:id', requireRole('SYSTEM_ADMIN'), requireOrgScope, async (req, res, next) => {
   try {
     const org = await Organization.findByIdAndDelete(req.params.id)
     if (!org) return res.status(404).json({ error: 'Organization not found' })
 
     await AuditLog.create({
       action: 'Organization deleted',
-      actor: 'System Administrator',
+      actor: req.user.name,
       target: org.name,
+      ip: req.ip,
     })
 
     res.status(204).send()
