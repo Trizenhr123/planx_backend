@@ -1,7 +1,10 @@
 import { Router } from 'express'
 import { AuditLog } from '../models/AuditLog.js'
+import { requireAuth } from '../middleware/auth.js'
 
 export const auditLogsRouter = Router()
+
+auditLogsRouter.use(requireAuth)
 
 auditLogsRouter.get('/', async (_req, res, next) => {
   try {
@@ -14,7 +17,7 @@ auditLogsRouter.get('/', async (_req, res, next) => {
         target: l.target,
         timestamp: l.createdAt.toISOString(),
         ip: l.ip,
-      }))
+      })),
     )
   } catch (err) {
     next(err)
